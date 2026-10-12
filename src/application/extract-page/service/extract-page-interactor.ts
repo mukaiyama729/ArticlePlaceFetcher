@@ -19,12 +19,15 @@ export type ExtractionPolicy = {
   confirmThreshold: number;
 };
 
+// LOGIC.md「4. モデル出力をローカルで検査する」：表記ゆれを吸収して本文中の拠点名を照合できるよう正規化する。
 const normalize = (value: string): string =>
   value
     .normalize("NFKC")
     .toLocaleLowerCase()
     .replace(/[\p{P}\p{Z}\p{S}\s]/gu, "");
 
+// LOGIC.md「4. モデル出力をローカルで検査する」：AIが指定した本文ノードを根拠に拠点名を照合する。
+// 括弧書きなどの補足を除いた名称でも照合し、根拠のない候補は後段で除外する。
 const hasTextualSupport = (
   location: Location,
   contentNodes: ContentNode[],
@@ -46,6 +49,7 @@ const hasTextualSupport = (
   return coreName.length >= 2 && sourceText.includes(coreName);
 };
 
+// LOGIC.md「4. 画像confidenceと候補スコア」：順位付け結果に該当画像がない場合の診断用既定値。
 const emptyPairingEvidence = {
   candidateScore: 0,
   sameContainer: false,
@@ -65,6 +69,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
   ) {}
 
   async execute(input: { url: string }): Promise<void> {
+    // LOGIC.md「1. ページを描画して根拠を採取する」：URLからページ情報を取得し、成功・失敗を問わず資源を閉じる。
     const capturedPage = await this.pageCapture.capture(input.url);
     try {
       await this.extractCapturedPage(capturedPage);
@@ -74,6 +79,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
   }
 
   private async extractCapturedPage(capturedPage: CapturedPage): Promise<void> {
+    // LOGIC.md「1. ページを描画して根拠を採取する」：取得済みDOM情報と任意のブラウザー検査結果を抽出に使う。
     const snapshot = capturedPage.snapshot;
     const browserInspection = capturedPage.browserInspection;
     let screenshot: BrowserScreenshot | null = null;
@@ -83,6 +89,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
 
     if (browserInspection) {
       try {
+        // LOGIC.md「1. ページを描画して根拠を採取する」：全ページ画像を試し、失敗時は初期表示範囲へ切り替える。
         screenshot = await browserInspection.takeScreenshot(true);
         mappingScreenshotMode = "FULL_PAGE";
       } catch (error) {
@@ -94,11 +101,13 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
         mappingScreenshotMode = screenshot ? "VIEWPORT_FALLBACK" : "UNAVAILABLE";
       }
     } else {
+      // LOGIC.md「1. ページを描画して根拠を採取する」：ブラウザー検査が使えなかった理由を診断として返す。
       mappingScreenshotFallbackReason = capturedPage.browserInspectionFailure;
     }
 
     let extraction: Awaited<ReturnType<ArticleMapper["map"]>>;
     try {
+      // LOGIC.md「2. GPT-6 Lunaへ渡す内容」「3. Lunaに求める出力」：ページ情報をAIへ渡して拠点と画像の対応候補を得る。
       extraction = await this.articleMapper.map({
         pageTitle: snapshot.title,
         pageUrl: snapshot.finalUrl,
@@ -108,9 +117,12 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
         accessibilitySnapshot: browserInspection?.initialAccessibilitySnapshot ?? "",
       });
     } catch {
+      // LOGIC.md「全体フロー」のモデル判定段階：外部モデルの失敗をアプリケーション層のエラーとして伝える。
       throw new ModelServiceFailedError("The article location and image mapping request failed.");
     }
 
+    // LOGIC.md「4. モデル出力をローカルで検査する」：AIが抽出した拠点名が指定本文にあるか再確認する。
+    // 根拠が見つからない候補は出力対象から外し、理由と参照本文を診断用に残す。
     const supportedLocations: MappedLocation[] = [];
     const unsupportedLocationReferences: LocationExtractionIssueOutput[] = [];
     for (const location of extraction.locations) {
@@ -129,10 +141,12 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
       }
     }
 
+    // LOGIC.md「4. 画像confidenceと候補スコア」：検証済み拠点ごとに画像の採否・根拠・失敗理由を組み立てる。
     const outputLocations = supportedLocations.map((location) =>
       this.toOutputLocation(location, snapshot, extraction.model),
     );
 
+    // LOGIC.md「5. 最終レスポンスで確認できる項目」：未解決候補に参照本文を添えて根拠を追跡できるようにする。
     const toExtractionIssue = (
       candidate: { name: string | null; sourceNodeIds: string[]; reason: string },
     ): LocationExtractionIssueOutput => ({
@@ -143,6 +157,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
     });
     const browserDiagnostics = browserInspection?.getDiagnostics();
 
+    // LOGIC.md「5. 最終レスポンスで確認できる項目」：抽出結果とページ取得・ブラウザー検査などの診断情報をまとめる。
     const output: ExtractPageOutputData = {
       page: {
         requestedUrl: snapshot.requestedUrl,
@@ -189,6 +204,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
     snapshot: PageSnapshot,
     model: string,
   ) {
+    // LOGIC.md「4. 画像confidenceと候補スコア」：本文根拠に近い画像を順位付けし、AIの画像IDを取得済み画像と照合する。
     const contentNodeIds = new Set(snapshot.contentNodes.map((node) => node.id));
     const imageById = new Map(snapshot.images.map((image) => [image.id, image]));
     const rankedCandidates = rankImageCandidates(
@@ -206,6 +222,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
     const candidateDiagnostics: ImageCandidateDiagnosticOutput[] = [];
 
     for (const assignment of assignments) {
+      // LOGIC.md「4. モデル出力をローカルで検査する」：AIの画像IDが取得済み画像にない場合は不正参照として記録する。
       const image = imageById.get(assignment.imageNodeId);
       if (!image) {
         invalidImageNodeIds.push(assignment.imageNodeId);
@@ -213,6 +230,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
       }
       const candidate = candidateByImageId.get(image.id);
       const pairingEvidence = candidate?.evidence ?? emptyPairingEvidence;
+      // LOGIC.md「4. 画像confidenceと候補スコア」：閾値以上の画像だけを採用し、それ以外も診断には残す。
       const confirmed = assignment.confidence >= this.policy.confirmThreshold;
       const sourceNodes = snapshot.contentNodes.filter((node) =>
         location.sourceNodeIds.includes(node.id),
@@ -242,6 +260,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
       });
 
       if (!confirmed) continue;
+      // LOGIC.md「5. 最終レスポンスで確認できる項目」：採用画像に本文・DOM位置・候補スコアなどの根拠を付ける。
       matchedImages.push({
         imageUrl: image.url,
         confidence: assignment.confidence,
@@ -264,6 +283,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
       });
     }
 
+    // LOGIC.md「5. 最終レスポンスで確認できる項目」：同じ画像URLが重複して出力されないように整理する。
     const uniqueImages = [
       ...new Map(matchedImages.map((image) => [image.imageUrl, image])).values(),
     ];
@@ -271,6 +291,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
     let imageFailure: LocationImageFailureOutput | null = null;
 
     if (uniqueImages.length === 0) {
+      // LOGIC.md「5. 最終レスポンスで確認できる項目」：画像未取得・不正ID・確信度不足・AI未判定を区別して返す。
       const rationale = location.mappingRationale || "モデルから説明が返りませんでした。";
       imageFailure =
         snapshot.images.length === 0
@@ -294,6 +315,7 @@ export class ExtractPageInteractor implements ExtractPageUseCase {
                 };
     }
 
+    // LOGIC.md「4. 画像confidenceと候補スコア」：採用画像があればCONFIRMEDとし、最大confidenceを代表値にする。
     return {
       name: location.name,
       address: location.address,
